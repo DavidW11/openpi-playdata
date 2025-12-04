@@ -70,7 +70,7 @@ def get_roboarena_configs():
             data=SimpleDataConfig(
                 assets=AssetsConfig(asset_id="droid"),
                 data_transforms=lambda model: _transforms.Group(
-                    inputs=[droid_policy.DroidInputs(action_dim=model.action_dim, model_type=ModelType.PI0_FAST)],
+                    inputs=[droid_policy.DroidInputs(model_type=ModelType.PI0_FAST)],
                     outputs=[droid_policy.DroidOutputs()],
                 ),
                 base_config=DataConfig(
