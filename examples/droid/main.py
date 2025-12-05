@@ -64,6 +64,8 @@ class Args:
 
     save_video: bool = False  # whether to save video of rollouts
 
+    long_data_collection: bool = False  # whether to do long data collection sessions (many rollouts without resetting env)
+
     continue_from_last: bool = False  # whether to continue data collection from last session
 
     num_trajectories_to_collect: int = 10
@@ -108,8 +110,6 @@ def main(args: Args):
     # Connect to the policy server
     policy_client = websocket_client_policy.WebsocketClientPolicy(args.remote_host, args.remote_port)
 
-    # TODO: 1) H5 file path
-
     max_count = args.num_trajectories_to_collect # number of rollouts per session
 
     # get string for today's date
@@ -117,36 +117,48 @@ def main(args: Args):
         date_str = datetime.datetime.now().strftime("%Y_%m_%d")
     else:
         date_str = args.date_str
-    # check args.save_base_dir to see if there s already a folder for today's date. if so, append a "_2", "_3", etc.
-    data_collection_idx = 1
-    save_root_dir = None
-    while True:
-        date_folder = os.path.join(args.save_base_dir, f"{date_str}_{data_collection_idx}")
-        if not os.path.exists(date_folder):
-            save_root_dir = date_folder
-            if not args.continue_from_last:
-                os.makedirs(date_folder, exist_ok=True)
-            break
-        data_collection_idx += 1
     
-    if args.continue_from_last:
-        data_collection_idx -= 1
-        save_root_dir = os.path.join(args.save_base_dir, f"{date_str}_{data_collection_idx}")
-        print(f"Continuing data collection in existing folder: {save_root_dir}")
-    # h5_path = f"/home/tennyyin/openpi-playdata/examples/droid/data/trajectories_{data_collection_idx}.h5"
+    # check args.save_base_dir to see if there s already a folder for today's date. if so, append a "_2", "_3", etc.
+    if not args.long_data_collection:
+        data_collection_idx = 1
+        save_root_dir = None
+        while True:
+            date_folder = os.path.join(args.save_base_dir, f"{date_str}_{data_collection_idx}")
+            if not os.path.exists(date_folder):
+                save_root_dir = date_folder
+                if not args.continue_from_last:
+                    os.makedirs(date_folder, exist_ok=True)
+                break
+            data_collection_idx += 1
+        
+        if args.continue_from_last:
+            data_collection_idx -= 1
+            save_root_dir = os.path.join(args.save_base_dir, f"{date_str}_{data_collection_idx}")
+            print(f"Continuing data collection in existing folder: {save_root_dir}")
+    else:
+        # long play data is saved just in date_str/
+        save_root_dir = os.path.join(args.save_base_dir, f"{date_str}_long")
+        os.makedirs(save_root_dir, exist_ok=True)
 
     while True:
+        # =========================================================================
+        # ====================== Data Collection Loop Starts ======================
+        # =========================================================================
+
         count = 0
-        max_count = args.num_trajectories_to_collect # number of rollouts per session
+        instruction = ""
+        
+        if not args.long_data_collection:
+            max_count = args.num_trajectories_to_collect # number of rollouts per session
+        else:
+            max_count = 1000000  # effectively infinite rollouts in long data collection mode
+            args.continue_from_last = True  # always continue from last in long data collection mode
+
         timestamp_folder = datetime.datetime.now().strftime("%I:%M%p_%B_%d_%Y")
-        # timestamp_str = datetime.datetime.now().strftime("%H_%M_%S")
-        # create folder for current trajectory
-        # traj_folder = os.path.join(save_root_dir, f"trajectory_{timestamp_str}")
-        # os.makedirs(traj_folder, exist_ok=True)
-        # h5_path = os.path.join(traj_folder, "trajectory.h5")
+        
+        # TODO is this needed?
         if args.save_video:
             video = []
-        instruction = ""
 
         if args.continue_from_last:
             # identify last collected trajectory
@@ -159,19 +171,40 @@ def main(args: Args):
                 ]
                 if existing_traj_indices:
                     last_traj_idx = max(existing_traj_indices)
-                    count = last_traj_idx + 1
+                    # check if the folder is complete
+                    traj_folder = os.path.join(save_root_dir, f"{last_traj_idx}")
+                    h5_path = os.path.join(traj_folder, "trajectory.h5")
+                    if not os.path.exists(h5_path):
+                        print(f"Last trajectory folder {traj_folder} is incomplete, resuming from there.")
+                        # remove all files in the folder
+                        for f in os.listdir(traj_folder):
+                            os.remove(os.path.join(traj_folder, f))
+                        count = last_traj_idx
+                    else:
+                        count = last_traj_idx + 1
                     print(f"Resuming from trajectory index {count}.")
-                    
+
+        # =====================================================================================================
+        # ==================================== Data Collection Loop Starts ====================================
+        # =====================================================================================================
+
+        # Variables to keep track
+        last_instruction_scene_reset_count = 0
+        last_instruction_detect_oob_count = 0
+        relax_safety_filter_count = 0
+        enable_safety_filter = True
+
+        critical_failure_occurred = 0
+
         while count < max_count:
-            traj_folder = os.path.join(save_root_dir, f"{count}")
-            os.makedirs(traj_folder, exist_ok=True)
-            h5_path = os.path.join(traj_folder, "trajectory.h5")
+
+            if critical_failure_occurred >= 10:
+                print("Critical failures occurred multiple times, ending data collection session.")
+                raise RuntimeError("Too many critical failures during data collection.")
+            
             count += 1
             print(f"Starting rollout {count}/{max_count}...")
-            # df = pd.DataFrame(columns=["success", "duration", "video_filename"])
-            # Get initial observation
 
-            # TODO: 2) Initialize empty arrays for the entire trajectory
             left_base_cam = []
             right_base_cam = []
             wrist_cam = []
@@ -179,6 +212,10 @@ def main(args: Args):
             gripper_position = []
             cartesian_position = []
             action_list = []
+
+            traj_folder = os.path.join(save_root_dir, f"{count}")
+            os.makedirs(traj_folder, exist_ok=True)
+            h5_path = os.path.join(traj_folder, "trajectory.h5")
             
             # Rollout parameters
             actions_from_chunk_completed = 0
@@ -193,10 +230,27 @@ def main(args: Args):
 
             image_right = curr_obs[f"{args.external_camera}_image"]
             image_wrist = curr_obs["wrist_image"]
+
             # Get instruction from user
             print("Generating instruction...")
             instruction = generate_prompt(image_right, image_wrist, object="none")
             print(f"Instruction: {instruction}")
+
+            if is_reset_command(instruction):
+                last_instruction_detect_oob_count += 1
+            else:
+                last_instruction_detect_oob_count = 0
+
+            if last_instruction_scene_reset_count >= 3 and last_instruction_detect_oob_count >= 3:
+                # if we have reset the scene 3 times trying to reset an object, will relax safety filter
+                enable_safety_filter = False
+                relax_safety_filter_count += 1
+
+            # reset state to before
+            if relax_safety_filter_count >= 5:
+                enable_safety_filter = True
+                relax_safety_filter_count = 0
+                critical_failure_occurred += 1
 
             for t_step in bar:
                 start_time = time.time()
@@ -264,6 +318,7 @@ def main(args: Args):
 
                     # Safety Check
                     need_reset = False
+                    need_reset_strict = False
 
                     all_joint_positions = curr_obs["joint_position"]
 
@@ -338,53 +393,23 @@ def main(args: Args):
                         for j in range(7):
                             if not (all_joint_limits[j][0] <= all_joint_positions[j] <= all_joint_limits[j][1]):
                                 print(f"Joint {j+1} limit exceeded {all_joint_positions[j]}, resetting environment...")
-                                need_reset = True
+                                need_reset_strict = True
                                 break
 
-                    if need_reset:
+                    if need_reset_strict or (need_reset and not enable_safety_filter):
+                        last_instruction_scene_reset_count += 1
                         env.reset()
                         # sleep for 2 seconds to allow environment to reset
                         time.sleep(3)
                         break
+                    else:
+                        last_instruction_scene_reset_count = 0
 
-                    # if abs(curr_obs["joint_position"][6]) > 1.57:
-                    #     print("Joint 7 limit exceeded, resetting environment...")
-                    #     env.reset()
-                    #     # sleep for 2 seconds to allow environment to reset
-                    #     time.sleep(2)
-                    #     break
-                    # if abs(curr_obs["joint_position"][3]) > 3.5:
-                    #     print("Joint 4 limit exceeded, resetting environment...")
-                    #     env.reset()
-                    #     time.sleep(2)
-                    #     break
-                    # print("Step to next action...")
-                    
-                    # print the largest joint velocity command
-                    # max_joint_velocity = np.max(np.abs(action[:-1]))
-                    # # print(f"Max joint velocity command: {max_joint_velocity:.3f}")
-                    # # cap all joint velocity commands < 0.7
-                    # if max_joint_velocity > 0.7:
-                    #     print("Joint velocity command too high, clipping abs to 0.7")
-                    #     action[:-1] = action[:-1] * (0.7 / max_joint_velocity)
-                    
                     env.step(action)
-
-                    # TODO: 3) append to arrays
-                    # curr_obs["joint_position"] - (7,)
-                    # curr_obs["gripper_position"] - (1,)
-                    # curr_obs["cartesian_position"] - (6,)
-                    # action - (8,)
-                    # base image: image_tools.resize_with_pad(curr_obs[f"{args.external_camera}_image"], 224, 224) - (224, 224, 3)
-                    # wrist image_left: image_tools.resize_with_pad(curr_obs["wrist_image"]
-                    # curr_obs["wrist_image"] - (720, 1280, 3), type: ndarray
-                    # reshape: 180, 320, 3
 
                     all_image_obs = all_obs["image"]
 
                     # reshape images
-                    # external_image = curr_obs[f"{args.external_camera}_image"]
-
                     left_external_image = all_image_obs[f"{args.left_camera_id}_left"]
                     left_external_image_resized = cv2.resize(left_external_image, (320, 180))
                     right_external_image = all_image_obs[f"{args.right_camera_id}_left"]
@@ -414,29 +439,6 @@ def main(args: Args):
                         time.sleep(1 / DROID_CONTROL_FREQUENCY - elapsed_time)
                 except KeyboardInterrupt:
                     break
-            # success = None
-            # while not isinstance(success, float):
-            #     success = input(
-            #         "Did the rollout succeed? (enter y for 100%, n for 0%), or a numeric value 0-100 based on the evaluation spec"
-            #     )
-            #     if success == "y":
-            #         success = 1.0
-            #     elif success == "n":
-            #         success = 0.0
-
-            #     success = float(success) / 100
-            #     if not (0 <= success <= 1):
-            #         print(f"Success must be a number in [0, 100] but got: {success * 100}")
-
-            # df = df.append(
-            #     {
-            #         "success": success,
-            #         "duration": t_step,
-            #         "video_filename": save_filename,
-            #     },
-            #     ignore_index=True,
-            # )
-            
             
             print("Resetting the environment for the next rollout...")
             os.makedirs("/home/tennyyin/openpi-playdata/examples/droid/results", exist_ok=True)
@@ -452,9 +454,6 @@ def main(args: Args):
                 with open("/home/tennyyin/openpi-playdata/examples/droid/results/observations_" + timestamp_folder + ".csv", "a") as f:
                     writer = csv.writer(f)
                     writer.writerow([instruction])
-                # Append to CSV file
-
-                # TODO: 4) convert to np.ndarrays
 
                 left_base_cam = np.stack(left_base_cam)
                 right_base_cam = np.stack(right_base_cam)
@@ -471,7 +470,6 @@ def main(args: Args):
                     image_clip = ImageSequenceClip(list(video), fps=10)
                     image_clip.write_videofile(save_filename, codec="libx264")
 
-                # TODO: 5) Open the file each loop (append mode)
                 with h5py.File(h5_path, "a") as f:
                     # traj_name = f"trajectory_{count}"
                     traj_name = "data"
@@ -480,10 +478,6 @@ def main(args: Args):
                     grp = f.create_group(traj_name)
 
                     # Create datasets for each array
-                    # compression="gzip"
-                    # grp.create_dataset("left_base_cam", data=left_base_cam)
-                    # grp.create_dataset("right_base_cam", data=right_base_cam)
-                    # grp.create_dataset("wrist_cam", data=wrist_cam)
                     grp.create_dataset("joint_position", data=joint_position)
                     grp.create_dataset("gripper_position", data=gripper_position)
                     grp.create_dataset("cartesian_position", data=cartesian_position)
@@ -491,22 +485,6 @@ def main(args: Args):
 
                     # add metadata as attributes
                     grp.attrs["trajectory_index"] = count
-                # print("end of loop")
-
-        # timestamp = datetime.datetime.now().strftime("%I:%M%p_%B_%d_%Y")
-        # if args.save_video:
-        #         video = np.stack(video)
-        #         folder_path = "/home/tennyyin/openpi-playdata/examples/droid/play_videos_miyu/play_data"
-        #         os.makedirs(folder_path, exist_ok=True)
-        #         save_filename = folder_path + "/" + timestamp + '.mp4'
-        #         image_clip = ImageSequenceClip(list(video), fps=10)
-        #         image_clip.write_videofile(save_filename, codec="libx264")
-        break
-    # os.makedirs("results", exist_ok=True)
-    # timestamp = datetime.datetime.now().strftime("%I:%M%p_%B_%d_%Y")
-    # csv_filename = os.path.join("results", f"eval_{timestamp}.csv")
-    # df.to_csv(csv_filename)
-    # print(f"Results saved to {csv_filename}")
 
 
 def _extract_observation(args: Args, obs_dict, *, save_to_disk=False):  
@@ -564,44 +542,14 @@ def generate_image(image):
 
     return base64.b64encode(buffered.read()).decode("utf-8")
 
+def is_reset_command(s):
+    keywords = ["toward", "center", "table"]
+    s_lower = s.lower()
+    return all(word in s_lower for word in keywords)
+
 def generate_prompt(image_right, image_wrist, object):
     base64_image_right = generate_image(image_right)
     base64_image_wrist = generate_image(image_wrist)
-    # user_input = "You are given an image from a robot's right external camera and the wrist camera." \
-    # "Look at the objects in the image, and separate them into categories of ""in the bowl"" and ""on the table"". " \
-    # "Name them by name (e.g., apple, banana, cup, etc.) and not by color. " \
-    # "Output the two lists, with elements in the list separated by commas and the list themselves separated by a "";""."\
-    # "Output the two lists with no other information. "
-    
-    # user_input = "You are a robot that is trying to randomly manipulate/arrange objects on the table. Existing objects on the table are: banana, carrot, green peppe, tomato."\
-    # "You can only choose from one of the three following task types:"\
-    # "pick up the <> and put it into the bowl"\
-    # "take the <> out of the bowl and put it on the table"\
-    # "push the <> towards the <left/right/up/down>"\
-    # "choose one object randomly. if it is in the green bowl, choose the section option. else, choose one task randomly. and fill in the <>."\
-    # "Only output the concise task, and do not include any other explanations."
-    
-
-    # user_input = """
-    # You are a robot that is trying to randomly manipulate/arrange objects on the table.
-    # Existing objects on the table are: carrot, white toy, wooden cube, and ceramic bowl.
-    # You can only choose from one of the three following task types:
-    # 1) Pick up the <> and put it into the bowl.
-    # 2) Pick the <> out of the bowl and put it on the table.
-    # 3) Move the <> towards the <left/right/up/down>.
-    # If any objects are outside of the rectangle defined by the tan masking tape, choose task 3 to move the object back within the boundary.
-    # Choose one object randomly. See whether or not it is in the bowl.
-    # If it is NOT IN the bowl, choose task 1 or 3 and DO NOT choose task 2.
-    # If it is in the ceramic bowl, choose task 2.
-    # Else, choose one task randomly and fill in the <>.
-    # Only output the concise task, and do not include any other explanations.
-
-    # Additional constraints:
-    # 1) There is tan masking tape that defines a rectangular area on the table. All objects must remain within this boundary.
-    # 2) The bowl is ceramic and fragile. Do not pick it up.   
-
-    #Existing objects on the table are: carrot, white polar bear (white toy), wood block, and ceramic bowl.
-    # """
 
     user_input = """
     You are a robot that is trying to randomly manipulate/arrange objects on the table in a square region marked by tape.
@@ -620,7 +568,6 @@ def generate_prompt(image_right, image_wrist, object):
     response = client.responses.create(
         model = "gpt-5-mini",
         input = [
-            #{"role": "system", "content": system_message},
             {"role": "user", "content": [
                 {"type": "input_text", "text": user_input},
                 {"type": "input_image", "image_url": f"data:image/jpeg;base64,{base64_image_right}"},
@@ -628,36 +575,8 @@ def generate_prompt(image_right, image_wrist, object):
             ]}
         ]
     )
-    # lists = response.output_text.strip().split(";")
-    # print(lists)
-    # bowl_objects = lists[0].split(":")[1].split(",")
-    # table_objects = lists[1].split(":")[1].split(",")
-    # bowl_objects = [obj.strip() for obj in bowl_objects]
-    # table_objects = [obj.strip() for obj in table_objects]
-    # if bowl_objects == ['none'] or bowl_objects == ['']:
-    #     object = table_objects[np.random.randint(0, len(table_objects))].strip()
-    #     random_number = np.random.randint(1, 2)
-    #     if random_number == 1:
-    #         prompt = f"Pick up the {object} from the table and place it in the bowl."
-    #     else:
-    #         prompt = f"Push the {object} on the table to the bowl."
-    # elif table_objects == ['none'] or table_objects == ['']:
-    #     object = bowl_objects[np.random.randint(0, len(bowl_objects))].strip()
-    #     prompt = f"Pick up the {object} from the bowl and place it on the table."
-    # else:
-    #     random_number = np.random.randint(1, 4)
-    #     if random_number == 1:
-    #         object = bowl_objects[np.random.randint(0, len(bowl_objects))].strip()
-    #         prompt = f"Pick up the {object} from the bowl and place it on the table."
-    #     elif random_number == 2:
-    #         object = table_objects[np.random.randint(0, len(table_objects))].strip()
-    #         prompt = f"Pick up the {object} from the table and place it in the bowl."
-    #     elif random_number == 3:
-    #         object = table_objects[np.random.randint(0, len(table_objects))].strip()
-    #         prompt = f"Push the {object} on the table to the bowl."
-    #     else:
-    #         prompt = f"Push the bowl."
     instruction = response.output_text.strip()
+
     return instruction
 
 
